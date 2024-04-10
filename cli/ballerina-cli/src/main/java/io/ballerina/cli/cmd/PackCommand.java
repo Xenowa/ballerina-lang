@@ -13,7 +13,10 @@ import io.ballerina.cli.utils.FileUtils;
 import io.ballerina.projects.BuildOptions;
 import io.ballerina.projects.Project;
 import io.ballerina.projects.ProjectException;
+import io.ballerina.projects.buildtools.CodeGeneratorTool;
+import io.ballerina.projects.buildtools.ToolConfig;
 import io.ballerina.projects.directory.BuildProject;
+import io.ballerina.projects.internal.model.BalToolDescriptor;
 import io.ballerina.projects.util.ProjectConstants;
 import io.ballerina.projects.util.ProjectUtils;
 import io.ballerina.toml.semantic.TomlType;
@@ -22,14 +25,24 @@ import org.ballerinalang.toml.exceptions.SettingsTomlException;
 import org.wso2.ballerinalang.util.RepoUtils;
 import picocli.CommandLine;
 
+import java.io.IOException;
 import java.io.PrintStream;
+import java.net.MalformedURLException;
+import java.net.URL;
+import java.net.URLClassLoader;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
+import java.util.Optional;
+import java.util.ServiceConfigurationError;
+import java.util.ServiceLoader;
 
 import static io.ballerina.cli.cmd.Constants.PACK_COMMAND;
 import static io.ballerina.projects.internal.ManifestBuilder.getStringValueFromTomlTableNode;
+import static io.ballerina.projects.util.ProjectUtils.isNewUpdateDistribution;
 import static io.ballerina.projects.util.ProjectUtils.isProjectUpdated;
 import static io.ballerina.runtime.api.constants.RuntimeConstants.SYSTEM_PROP_BAL_DEBUG;
 
@@ -246,6 +259,15 @@ public class PackCommand implements BLauncherCmd {
         // Check package files are modified after last build
         boolean isPackageModified = isProjectUpdated(project);
 
+        // Validate tool and sub-command existence
+        try {
+            validateTool(project);
+        } catch (ServiceConfigurationError | IOException e) {
+            CommandUtil.printError(this.errStream, e.getMessage(), null, false);
+            CommandUtil.exitError(this.exitWhenFinish);
+            return;
+        }
+
         TaskExecutor taskExecutor = new TaskExecutor.TaskBuilder()
                 .addTask(new CleanTargetDirTask(isPackageModified, buildOptions.enableCache()), isSingleFileBuild)
                 .addTask(new RunBuildToolsTask(outStream), isSingleFileBuild)
@@ -260,6 +282,158 @@ public class PackCommand implements BLauncherCmd {
         if (this.exitWhenFinish) {
             Runtime.getRuntime().exit(0);
         }
+    }
+
+    private void validateTool(Project project) throws ServiceConfigurationError, IOException {
+        // Get the BalTools.toml content
+        Optional<BalToolDescriptor> balToolDescriptor = project.currentPackage().manifest().balToolDescriptor();
+        if (balToolDescriptor.isPresent()) {
+            BalToolDescriptor balToolManifest = balToolDescriptor.get();
+            String id = balToolManifest.tool().getId();
+            List<URL> jarURLs = new ArrayList<>();
+
+            List<String> toolDependencyJARs = balToolManifest.getBalToolDependencies();
+            toolDependencyJARs.forEach(dependencyJAR -> {
+                Path jarPath = Path.of(dependencyJAR);
+                if (Files.exists(jarPath)) {
+                    // Convert the paths to the URL Format
+                    try {
+                        jarURLs.add(jarPath.toUri().toURL());
+                    } catch (MalformedURLException e) {
+                        throw new RuntimeException(e);
+                    }
+                }
+            });
+
+            URLClassLoader ucl = new URLClassLoader(jarURLs.toArray(new URL[0]));
+
+            // Validate BLauncherCmd JARs
+            validateBlauncherTool(id, ucl, jarURLs);
+
+            // Validate CodeGeneratorTool JARs
+            validateCodeGeneratorTool(id, ucl, jarURLs);
+        }
+    }
+
+    private void validateBlauncherTool(String toolId,URLClassLoader ucl, List<URL> jarURLs) {
+        List<String> allCommandNames = new ArrayList<>();
+        List<String> subCommandNames = new ArrayList<>();
+
+        // Load and check class which implements BLauncherCmd interface
+        ServiceLoader<BLauncherCmd> customBlauncherCmds = ServiceLoader.load(BLauncherCmd.class, ucl);
+        customBlauncherCmds.forEach(customCmd -> {
+            if (jarURLs.contains(customCmd.getClass().getProtectionDomain().getCodeSource().getLocation())) {
+                // Retrieve annotation of the command
+                CommandLine.Command commandAnnotation = customCmd.getClass()
+                        .getAnnotation(CommandLine.Command.class);
+
+                // Validate if main command follows expected pattern
+                boolean mainCommandValidity = validateCommandName(commandAnnotation.name());
+                if (!mainCommandValidity) {
+                    CommandUtil.printError(this.errStream, "invalid command name format for command '" +
+                            commandAnnotation.name() + "'",null, false);
+                    CommandUtil.exitError(this.exitWhenFinish);
+                }
+                allCommandNames.add(commandAnnotation.name());
+
+                // Retrieve the sub commands
+                Class<?>[] subcommands = commandAnnotation.subcommands();
+                List<Class<?>> list = Arrays.stream(subcommands).toList();
+                list.forEach(subcommand -> {
+                    // Retrieve annotation of the command
+                    Class<? extends BLauncherCmd> subCmdClass = (Class<? extends BLauncherCmd>) subcommand;
+                    CommandLine.Command subCommandAnnotation = subCmdClass.getAnnotation(CommandLine.Command.class);
+
+                    // Validate if sub command follows expected pattern
+                    boolean subCommandValidity = validateCommandName(subCommandAnnotation.name());
+                    if (!subCommandValidity) {
+                        CommandUtil.printError(this.errStream, "invalid command name format for command '" +
+                                        subCommandAnnotation.name() + "'",null, false);
+                        CommandUtil.exitError(this.exitWhenFinish);
+                    }
+                    subCommandNames.add(subCommandAnnotation.name());
+                });
+            }
+        });
+
+        if (toolId != null) {
+            allCommandNames.forEach(commandName -> {
+                if (!subCommandNames.contains(commandName) && !toolId.equals(commandName)) {
+                    CommandUtil.printError(this.errStream, "command name '" + commandName +
+                            "' does not match id '" + toolId + "' provided in " + ProjectConstants.BAL_TOOL_TOML,
+                            null, false);
+                    CommandUtil.exitError(this.exitWhenFinish);
+                }
+            });
+        }
+    }
+
+    private void validateCodeGeneratorTool(String toolId,URLClassLoader ucl, List<URL> jarURLs) {
+        List<String> allCommandNames = new ArrayList<>();
+        List<String> subCommandNames = new ArrayList<>();
+
+        // Load and check class which implements CodeGeneratorTool interface
+        ServiceLoader<CodeGeneratorTool> customBlauncherCmds = ServiceLoader.load(CodeGeneratorTool.class, ucl);
+        customBlauncherCmds.forEach(customCmd ->{
+            if (jarURLs.contains(customCmd.getClass().getProtectionDomain().getCodeSource().getLocation())) {
+                // Retrieve annotation of the command
+                ToolConfig commandAnnotation = customCmd.getClass().getAnnotation(ToolConfig.class);
+
+                // Validate if main command follows expected pattern
+                boolean mainCommandValidity = validateCommandName(commandAnnotation.name());
+                if (!mainCommandValidity) {
+                    CommandUtil.printError(this.errStream, "invalid command name format for command '" +
+                            commandAnnotation.name() + "'",null, false);
+                    CommandUtil.exitError(this.exitWhenFinish);
+                }
+                allCommandNames.add(commandAnnotation.name());
+
+                // Retrieve the sub commands
+                Class<?>[] subcommands = commandAnnotation.subcommands();
+                List<Class<?>> list = Arrays.stream(subcommands).toList();
+                list.forEach(subcommand -> {
+                    // Retrieve annotation of the command
+                    Class<? extends CodeGeneratorTool> subCmdClass = (Class<? extends CodeGeneratorTool>) subcommand;
+                    ToolConfig subCommandAnnotation = subCmdClass.getAnnotation(ToolConfig.class);
+
+                    // Validate if sub command follows expected pattern
+                    boolean subCommandValidity = validateCommandName(subCommandAnnotation.name());
+                    if (!subCommandValidity) {
+                        CommandUtil.printError(this.errStream, "invalid command name format for command '" +
+                                subCommandAnnotation.name() + "'",null, false);
+                        CommandUtil.exitError(this.exitWhenFinish);
+                    }
+                    subCommandNames.add(subCommandAnnotation.name());
+                });
+            }
+        });
+
+        if (toolId != null) {
+            allCommandNames.forEach(commandName -> {
+                if (!subCommandNames.contains(commandName) && !toolId.equals(commandName)) {
+                    CommandUtil.printError(this.errStream, "command name '" + commandName +
+                                    "' does not match id '" + toolId + "' provided in " + ProjectConstants.BAL_TOOL_TOML,
+                            null, false);
+                    CommandUtil.exitError(this.exitWhenFinish);
+                }
+            });
+        }
+    }
+
+    private boolean validateCommandName(String cmdName) {
+        boolean commandValidity = true;
+        if (cmdName == null || cmdName.isEmpty()) {
+            commandValidity = false;
+        } else if (!cmdName.matches("^\\w+$")) {
+            commandValidity = false;
+        } else if (cmdName.startsWith("_")) {
+            commandValidity = false;
+        } else if (cmdName.endsWith("_")) {
+            commandValidity = false;
+        } else if (cmdName.contains("__")) {
+            commandValidity = false;
+        }
+        return commandValidity;
     }
 
     private BuildOptions constructBuildOptions() {
